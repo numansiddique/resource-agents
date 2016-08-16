@@ -1,0 +1,339 @@
+#!/bin/sh
+#
+#       OCF Resource Agent compliant ovsdb-server script.
+#
+#       Implements ovsdb-server management
+#
+# Copyright (C) 2016 Red Hat, Inc.  All rights reserved.
+# Author: Numan Siddique <nusiddiq@redhat.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write the Free Software Foundation,
+# Inc., 59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+#
+#  OCF parameters are as below
+#    OCF_RESKEY_ovsdb_server_unixctl - The unixctl path of ovsdb-server to monitor
+
+#######################################################################
+# Initialization:
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+# binaries
+: ${OVSDB_SERVER:=/usr/local/sbin/ovsdb-server}
+: ${OVS_APPCTL:=/usr/local/bin/ovs-appctl}
+
+#######################################################################
+
+ovsdb_server_usage() {
+    cat <<END
+usage: $0 {start|stop|status|monitor|validate-all|meta-data}
+
+Expects to have a fully populated OCF RA-compliant environment set.
+END
+}
+
+ovsdb_server_metadata() {
+    cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="ovsdb-server">
+  <version>1.0</version>
+
+  <longdesc lang="en">
+    This resource manages ovsdb-server.
+  </longdesc>
+
+  <shortdesc lang="en">
+    Manages ovsdb-server.
+  </shortdesc>
+
+  <parameters>
+    <parameter name="ovsdb_server_unixctl" unique="1" required="1">
+      <longdesc lang="en">
+        The unixctl path of ovsdb-server to monitor.
+      </longdesc>
+      <shortdesc lang="en">
+        The unixctl path of ovsdb-server.
+      </shortdesc>
+      <content type="string"/>
+    </parameter>
+  </parameters>
+
+  <actions>
+    <action name="start"        timeout="30s" />
+    <action name="stop"         timeout="20s" />
+    <action name="status"       timeout="20s"  depth="0" interval="10s" />
+    <action name="monitor"      timeout="30s"  depth="0" interval="20s" />
+    <action name="monitor"      timeout="30s"  depth="0" interval="10s" role="Master" />
+    <action name="monitor"      timeout="30s"  depth="0" interval="10s" role="Slave" />
+    <action name="promote"      timeout="120s" />
+    <action name="demote"       timeout="120s" />
+    <action name="notify"       timeout="90s" />
+    <action name="meta-data"    timeout="5s" />
+    <action name="validate-all" timeout="20s" />
+  </actions>
+</resource-agent>
+END
+}
+
+ovsdb_server_validate_all () {
+    check_binary $OVSDB_SERVER
+    check_binary $OVS_APPCTL
+
+    if ! ocf_is_ms; then
+        ocf_exit_reason "ovsdb-server must be configured as a multistate Master/Slave resource."
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    if [ "${OCF_RESKEY_CRM_meta_master_max}" -ne 1 ]; then
+        ocf_exit_reason "ovsdb-server must be configured with master_max=1."
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    if [ -z "$OCF_RESKEY_ovsdb_server_unixctl" ]; then
+        ocf_log err "Invalid OCF_RESKEY_ovsdb_server_unixctl: value cannot be empty"
+	    return $OCF_ERR_ARGS
+    fi
+
+    return $OCF_SUCCESS    
+}
+
+master_score=1000
+slave_score=100
+
+target=`crm_node -n`
+
+ovsdb_server_set_master_score() {
+    ${HA_SBIN_DIR}/crm_master -Q -l reboot -v $1
+}
+
+ovsdb_server_is_master() {
+    # TODO: Once the ovs-appctl supports quering for the master/slave mode
+    # use it.
+    # This is for testing only.
+    [ $target == "v_fed_24" ]
+}
+
+ovsdb_server_monitor() {
+    $OVS_APPCTL -t $OCF_RESKEY_ovsdb_server_unixctl version
+    ret=$?
+    
+    if [ "$ret" == "$OCF_SUCCESS" ]; then
+        if ovsdb_server_is_master; then
+            ret=$OCF_RUNNING_MASTER
+            ovsdb_server_set_master_score $master_score
+        else
+            ovsdb_server_set_master_score $slave_score
+        fi
+    fi
+
+    return $ret
+}
+
+ovsdb_server_start() {
+    ovsdb_server_validate_all
+    ret=$?
+    if [ "$ret" != "$OCF_SUCCESS" ]; then
+	    return $ret
+    fi
+
+    # if ovsdb-server is already running, bail out early
+    ovsdb_server_monitor
+    ret=$?
+    if [ "$ret" == "$OCF_SUCCESS" ]; then
+        ocf_log info "ovsdb-server is already running"
+        return $OCF_SUCCESS
+    fi
+
+    if [ "$ret" == "$OCF_RUNNING_MASTER" ]; then
+        # Always start as a slave
+        ovsdb_server_set_master_score $slave_score
+        return $OCF_SUCCESS
+    fi
+
+    return $OCF_NOT_RUNNING
+}
+
+ovsdb_server_stop() {
+    return $OCF_SUCCESS
+}
+
+ovsdb_server_promote() {
+    local rc
+    ovsdb_server_validate_all || exit $?
+
+    # test the resource's current state
+    ovsdb_monitor
+    rc=$?
+    case "$rc" in
+        "$OCF_SUCCESS")
+            # Running as slave. Normal, expected behavior.
+            ocf_log debug "Resource is currently running as Slave"
+            ;;
+        "$OCF_RUNNING_MASTER")
+            # Already a master. Unexpected, but not a problem.
+            ocf_log info "Resource is already running as Master"
+        return $OCF_SUCCESS
+            ;;
+        "$OCF_NOT_RUNNING")
+            # Currently not running. Need to start before promoting.
+            ocf_log info "Resource is currently not running"
+            ovsdb_start
+            ;;
+        *)
+            # Failed resource. Let the cluster manager recover.
+            ocf_log err "Unexpected error, cannot promote"
+            exit $rc
+            ;;
+    esac
+
+    ocf_run frobnicate --master-mode || exit $OCF_ERR_GENERIC
+    while true; do
+        ovsdb_monitor
+        if [ $? -eq $OCF_RUNNING_MASTER ]; then
+            ocf_log debug "Resource promoted"
+            break
+        else
+            ocf_log debug "Resource still awaiting promotion"
+            sleep 1
+        fi
+    done
+
+    return $OCF_SUCCESS
+}
+
+ovsdb_server_demote() {
+    local rc
+    ovsdb_server_validate_all || exit $?
+
+    # test the resource's current state
+    ovsdb_monitor
+    rc=$?
+
+    case "$rc" in
+        "$OCF_RUNNING_MASTER")
+            # Running as master. Normal, expected behavior.
+            ocf_log debug "Resource is currently running as Master"
+            ;;
+        "$OCF_SUCCESS")
+            # Alread running as slave. Nothing to do.
+            ocf_log debug "Resource is currently running as Slave"
+            return $OCF_SUCCESS
+            ;;
+        "$OCF_NOT_RUNNING")
+            # Currently not running. Getting a demote action
+            # in this state is unexpected. Exit with an error
+            # and let the cluster manager recover.
+            ocf_log err "Resource is currently not running"
+            exit $OCF_ERR_GENERIC
+            ;;
+        *)
+            # Failed resource. Let the cluster manager recover.
+            ocf_log err "Unexpected error, cannot demote"
+            exit $rc
+            ;;
+    esac
+
+    ocf_run frobnicate --unset-master-mode || exit $OCF_ERR_GENERIC
+    while true; do
+        ovsdb_monitor
+        if [ $? -eq $OCF_RUNNING_MASTER ]; then
+            ocf_log debug "Resource still awaiting demotion"
+            sleep 1
+        else
+            ocf_log debug "Resource demoted"
+            break
+        fi
+    done
+
+    return $OCF_SUCCESS
+}
+
+ovsdb_server_notify() {
+    # echo "ovsdb_server_notify called buddy" >> /home/vagrant/ovsdb_ocs.txt
+    local type_op
+    type_op="${OCF_RESKEY_CRM_meta_notify_type}-${OCF_RESKEY_CRM_meta_notify_operation}"
+    ocf_log debug "Received $type_op notification."
+    case "$type_op" in
+    'pre-promote')
+        echo "ovsdb_server_notify pre-promote called buddy" >> /home/vagrant/ovsdb_ocs.txt
+        echo "master = $OCF_RESKEY_CRM_meta_notify_promote_uname" >> /home/vagrant/ovsdb_ocs.txt
+        ocf_run frobnicate --slave-mode \
+                               --master=$OCF_RESKEY_CRM_meta_notify_promote_uname \
+                               || exit $OCF_ERR_GENERIC
+        ;;
+    'post-demote')
+        echo "ovsdb_server_notify post-demote called buddy" >> /home/vagrant/ovsdb_ocs.txt
+        echo "master = $OCF_RESKEY_CRM_meta_notify_promote_uname" >> /home/vagrant/ovsdb_ocs.txt
+        ocf_run frobnicate --unset-slave-mode || exit $OCF_ERR_GENERIC
+        ;;
+    esac
+    return $OCF_SUCCESS
+}
+
+case $__OCF_ACTION in
+    meta-data)
+        ovsdb_server_metadata
+        exit $OCF_SUCCESS
+    ;;
+    usage|help)
+        ovsdb_server_usage
+        exit $OCF_SUCCESS
+    ;;
+esac
+
+
+case $__OCF_ACTION in
+    start)
+        ovsdb_server_start
+        exit $?
+    ;;
+
+    stop)
+        ovsdb_server_stop
+        exit $?
+    ;;
+
+    status|monitor)
+        ovsdb_server_monitor
+        exit $?
+    ;;
+
+    promote)
+        ovsdb_server_promote
+    ;;
+
+    demote)
+        ovsdb_server_demote
+    ;;
+
+    notify)
+        ovsdb_server_notify
+    ;;
+
+    validate-all)
+        # ovsdb_server_validate above does the trick
+    ;;
+
+    *)
+        ovsdb_server_usage
+        exit $OCF_ERR_UNIMPLEMENTED
+    ;;
+esac
