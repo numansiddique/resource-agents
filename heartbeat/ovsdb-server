@@ -172,7 +172,7 @@ ovsdb_server_check_status() {
         return $OCF_RUNNING_MASTER
     fi
 
-    stupid_print "ovsdb_server_check_status : $host_name running as slave" 
+    stupid_print "ovsdb_server_check_status : $host_name running as slave"
     return $OCF_RUNNING 
 }
 
@@ -188,6 +188,13 @@ connect_to_active_ovsdb_server() {
         if [ "$master_ip" != "$host_ip" ]; then
             stupid_print "connect_to_active_ovsdb_server : masterip not equal to host ip - master ip = $master_ip : host ip = $host_ip"
             $OVS_APPCTL -t $OCF_RESKEY_ovsdb_server_unixctl ovsdb-server/set-active-ovsdb-server tcp:$master_ip:6641
+        else
+            # If the master ip and host ip are same, it means this node is getting
+            # demoted or getting stopped.
+            if [ "$active_ovsdb_server" == "" ]; then
+                stupid_print "connect_to_active_ovsdb_server : setting active ovsdb server to 127.0.0.1:6600" 
+                $OVS_APPCTL -t $OCF_RESKEY_ovsdb_server_unixctl ovsdb-server/set-active-ovsdb-server tcp:127.0.0.1:6600
+            fi
         fi
     else
         # If the present master is not set and "$active_ovsdb_server" is empty
